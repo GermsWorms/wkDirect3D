@@ -5,7 +5,7 @@ same, pixel for pixel; it is only drawn sooner.
 
 It is a WormKit module: one file, `wkDirect3D.dll`, with nothing to set up.
 
-**This is a beta (0.4).** It has been tested on one PC, in a window, on replays. See "Not tested yet" before you rely on it.
+**This is a beta (0.5).** It has been tested on one PC, in a window, on replays. See "Not tested yet" before you rely on it.
 
 New in 0.4: it draws the **zoomed map** for [wkMapZoom](https://github.com/GermsWorms/wkMapZoom) 5 (see "Zoom"), and other
 modules can have true-colour pictures and lines drawn over the game through it
@@ -99,7 +99,8 @@ replays, 3,600 to 27,400 frames each (one of them from its start to its end): 0 
 
 To remove it, delete the file while WA is closed. `install.ps1` (and `install.ps1 -Remove`) does the same.
 
-To switch it off without removing it, put a file `wkDirect3D.ini` next to `WA.exe` with these two lines:
+To switch it off without removing it, put a file `wkDirect3D.ini` next to `WA.exe` with these two lines (or, from 0.5,
+switch it off and on in the game with [wkModMenu](https://github.com/GermsWorms/wkModMenu): Esc, Mods, wkDirect3D):
 
 ```
 [wkDirect3D]
@@ -116,7 +117,7 @@ Loaded together with wkDirect3D, each for a 20 second replay, with the picture c
 
 | Ran together, no crash | |
 |---|---|
-| Drawing and zoom | wkMapZoom 5.0 beta (its zoom is drawn by wkDirect3D) and 4.3 beta 2, wkSpeedometer 1.0, wkFastDraw, wkVista 0.1.4, wkZoom 0.2.0, wkRGBA, wkJellyWorm (3.8.1 v1) |
+| Drawing and zoom | wkMapZoom 5 (its zoom is drawn by wkDirect3D) and 4.3 beta 2, wkSpeedometer, wkModMenu (its panel is drawn through wkDirect3D), wkFastDraw, wkVista 0.1.4, wkZoom 0.2.0, wkRGBA, wkJellyWorm (3.8.1 v1) |
 | Modding | WormForge 0.9.9 |
 | Game and maps | wkRealTime 0.0.9.2, wkTerrainSync 1.2.6.1, wkTrackMeBetter 3.8.1, wkWall2Wall, wkPin 1.0.0.8, wkPlaceWorms, wkGolf, wkCrateEditor 1.0, wkRopeRaceDirection, wkTrackTime |
 | Controls, sound, menus | wkRemapKeys, wkVolumeControl, wkSuperFrontend, wkHelp, wkSetRes |
@@ -136,6 +137,7 @@ wkDirect3D.dll exports a few functions (cdecl, to be called on WA's thread while
 say exactly what each takes.
 
 - `wkDirect3D_Api()` returns the interface's number (1).
+- `wkModSettings()` and `wkModSettingsChanged()` are for wkModMenu: what the settings are, and that one was changed.
 - `wkDirect3D_Overlay(argb, w, h, pitch_bytes, x, y)` lays a true-colour picture (premultiplied A8R8G8B8) over the
   finished frame; `wkDirect3D_Triangles(vertices, count)` does the same with coloured, see-through triangles. Both
   return 0 when wkDirect3D is not drawing the frame, so the caller can draw into WA's own frame instead.

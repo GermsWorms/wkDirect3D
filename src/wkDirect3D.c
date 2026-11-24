@@ -62,7 +62,7 @@
 #include "image_guard.h"
 #include "shaders.h"
 
-#define VERSION "0.4 beta"
+#define VERSION "0.5 beta"
 #define WA_BASE 0x400000u
 #define VA(a) ((uintptr_t)(base + ((uintptr_t)(a) - WA_BASE)))
 #define P32(a) (*(uint32_t *)(uintptr_t)(a))
@@ -166,6 +166,7 @@ static int env_int(const char *name, int dflt) {
 /* ---- state ---- */
 enum { PASSIVE, ACTIVE };
 static int installed, mode, failed;     /* failed: something of Direct3D's could not be had: passive for good */
+static int user_off;                    /* switched off in the game (wkDirect3D.ini, Enabled=0, read again): passive until switched on */
 static unsigned frames, gpu_frames;     /* shown frames; those the GPU drew */
 static int frame_ops;                   /* GPU operations noted this frame */
 static int frame_abort;                 /* this frame cannot be finished on the GPU */
@@ -250,8 +251,8 @@ static IDirect3DTexture9 *zs_tex;       /* a zoomed frame's picture: true colour
 static IDirect3DSurface9 *zs_lvl, *zs_sys;
 static int zs_shown;                    /* the last frame shown was a zoomed one (a screenshot is taken from zs) */
 /* true-colour pictures and triangles other modules ask to have laid over the frame (the exported functions) */
-#define OVL_W 1024
-#define OVL_H 1024
+#define OVL_W 2048
+#define OVL_H 2048
 #define OVL_MAX 32
 #define TRI_MAX 190000
 typedef struct { float x, y, z, rhw; DWORD col; } tvert;
@@ -1802,6 +1803,22 @@ WKD3D_API int __cdecl wkDirect3D_Triangles(const wkd3d_vtx *v, int count) {
     return 1;
 }
 
+/* for wkModMenu (github.com/GermsWorms/wkModMenu): what the settings are, and that one was changed in the game */
+static char ini_file[MAX_PATH + 16];
+WKD3D_API const char *__cdecl wkModSettings(void) {
+    return "wkModSettings 1\n"
+           "title=wkDirect3D\n"
+           "file=wkDirect3D.ini\n"
+           "section=wkDirect3D\n"
+           "live=1\n"
+           "Enabled|The graphics card draws|bool||1|On: the graphics card draws the game's picture (and wkMapZoom's zoom). Off: WA draws it itself, as without the module. Switched off here it can be switched on again at once; started with it off, WA has to be started again.\n";
+}
+WKD3D_API void __cdecl wkModSettingsChanged(void) {
+    if (!ini_file[0]) return;
+    user_off = !GetPrivateProfileIntA("wkDirect3D", "Enabled", 1, ini_file);
+    say("settings read again (changed in the Mods menu): %s", user_off ? "off: WA draws by itself from the next frame on" : "on");
+}
+
 /* WA's show-frame and whatever other modules hung on it (wkMapZoom: its safety net before, its dial after), for a frame
  * the GPU has drawn already: WA's step is given a 1 x 1 frame to upload and a vertex buffer whose points are all one
  * point, so it costs next to nothing and draws nothing; the others' work happens as ever. */
@@ -1942,6 +1959,7 @@ static uint32_t *__attribute__((fastcall)) hook_show(void *be, uint32_t *result,
             if ((size_t)frame_layer_px * 2 > (size_t)my_w * my_h) { heavy++; light = 0; }
             else { heavy = 0; if (++light == 2000) heavy_wait = 64; }
             frame_layer_px = 0;
+            if (user_off) go_passive("switched off in the game (wkDirect3D.ini, Enabled=0): WA draws by itself until it is switched on again");
             if (heavy >= 8) {
                 go_passive(heavy_told ? NULL : "the picture comes almost whole from elsewhere (another module draws the map): WA shows such frames itself; tried again now and then");
                 heavy_told = 1;
@@ -1983,7 +2001,7 @@ static uint32_t *__attribute__((fastcall)) hook_show(void *be, uint32_t *result,
     r = orig_show(be, result, frame);
     last_wa_frame = (uintptr_t)frame;
     if (cooldown) cooldown--;
-    else if (!opt_off && !failed && passive_blits && frame && *result == P32(VA(BE_OK_VA)) && (!read_seen || frames - read_seen > 120)) {
+    else if (!opt_off && !user_off && !failed && passive_blits && frame && *result == P32(VA(BE_OK_VA)) && (!read_seen || frames - read_seen > 120)) {
         const int w = PI32(VA(FRAME_W_VA)), h = PI32(VA(FRAME_H_VA));
         IDirect3DDevice9 *dev = (IDirect3DDevice9 *)(uintptr_t)P32((uintptr_t)be + BE_DEV);
         if (dev && !*(uint8_t *)((uintptr_t)be + BE_LOST) && w == PI32((uintptr_t)be + BE_W) && h == PI32((uintptr_t)be + BE_H) &&
@@ -2190,6 +2208,7 @@ static void start(void) {
         strcpy(ini, exe);
         slash = strrchr(ini, '\\');
         strcpy(slash ? slash + 1 : ini, "wkDirect3D.ini");
+        strcpy(ini_file, ini);
         if (!GetPrivateProfileIntA("wkDirect3D", "Enabled", 1, ini)) { say("wkDirect3D " VERSION ": switched off in wkDirect3D.ini (Enabled=0): not installed"); return; }
     }
     opt_off = env_int("WKD3D_OFF", 0); opt_stats = env_int("WKD3D_STATS", 0); opt_trace = env_int("WKD3D_TRACE", 0);
