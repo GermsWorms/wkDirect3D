@@ -1,5 +1,10 @@
 # wkDirect3D
 
+> **wkDirect3D is part of [wkMapZoom](https://github.com/GermsWorms/wkMapZoom) now (version 6 and newer) and is no
+> longer developed here.** Install wkMapZoom instead and delete `wkDirect3D.dll`: wkMapZoom draws the game on the
+> graphics card by itself, zoomed or not. If you don't want to zoom, just don't: at 100% it is what wkDirect3D was.
+> What follows describes the last separate version, 0.5 beta.
+
 Makes the graphics card draw the in-game picture of **Worms Armageddon 3.8.1**, instead of the CPU. The picture stays the
 same, pixel for pixel; it is only drawn sooner.
 
