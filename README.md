@@ -5,7 +5,11 @@ same, pixel for pixel; it is only drawn sooner.
 
 It is a WormKit module: one file, `wkDirect3D.dll`, with nothing to set up.
 
-**This is a beta (0.3).** It has been tested on one PC, in a window, on replays. See "Not tested yet" before you rely on it.
+**This is a beta (0.4).** It has been tested on one PC, in a window, on replays. See "Not tested yet" before you rely on it.
+
+New in 0.4: it draws the **zoomed map** for [wkMapZoom](https://github.com/GermsWorms/wkMapZoom) 5 (see "Zoom"), and other
+modules can have true-colour pictures and lines drawn over the game through it
+([wkSpeedometer](https://github.com/GermsWorms/wkSpeedometer) does).
 
 ## How much faster
 
@@ -23,6 +27,29 @@ Frames a second on one desktop PC, 3.8.1 with the Direct3D 9 (shader) renderer, 
 Your numbers will differ with your PC and the map. The bigger the picture, the more it helps: the CPU's work grows with every
 pixel, the graphics card hardly notices. With vsync on, the frame rate stays your monitor's and WA uses less of your CPU
 instead: at 120 Hz and 1080p, WA's main thread used 11% of one core (14% with wkFastDraw).
+
+## Zoom
+
+With [wkMapZoom](https://github.com/GermsWorms/wkMapZoom) 5 loaded, wkDirect3D draws the zoomed map too. wkMapZoom decides
+the zoom (the mouse wheel, its auto zoom, its speed zoom) and has WA draw the whole area the zoomed view shows; wkDirect3D
+draws that at full size into a picture of its own, exactly as it draws an ordinary frame, and then puts it on the screen at
+the zoom, each screen pixel the average of the map pixels it covers. The HUD stays at its normal size.
+
+Frames a second, a large open map at full detail, vsync off:
+
+| | wkMapZoom 4.3 (draws on the CPU) | wkMapZoom 5 + wkDirect3D |
+|---|---|---|
+| 1920x1080 at 35% | 57 to 60 | 1440 |
+| 1920x1080 at 35%, on 4 CPU threads | 62 | 1520 |
+| 2560x1440 at 35% | 39 to 42 | 1180 |
+| 1920x1080 at 25% | | 1310 |
+| 2560x1440 at 25% | | 900 |
+| 3840x2160 at 50% | | 870 |
+| 3840x2160 at 25% | | 460 |
+
+The full-size map is checked the same way as an ordinary frame (see below): 0 pixels differ from WA's own drawing, from
+25% to 800%. Zoomed out, that map is big: at 25% sixteen times the screen (at 3840x2160, 664 MB on the graphics card). If
+the card cannot make it, wkMapZoom's zoom goes less far out, and the log says so.
 
 ## How it works
 
@@ -61,9 +88,9 @@ replays, 3,600 to 27,400 frames each (one of them from its start to its end): 0 
   players are WA's own, so nobody else needs the module.
 - **Input lag.** WA still hands over one frame at a time; with vsync on, the wait for the monitor measured the same as
   without the module (7.6 to 8.0 ms at 120 Hz), so no extra frame is queued.
-- **A map drawn by another module.** Zoomed out with [wkMapZoom](https://github.com/GermsWorms/wkMapZoom), the map is
-  drawn by wkMapZoom, so wkDirect3D has nothing to speed up there yet. At 100% zoom it draws (486 to 1373 fps at 1080p
-  with wkMapZoom 4.3 beta 2 loaded).
+- **A map drawn by another module.** wkMapZoom up to 4.3 draws the zoomed map itself, so wkDirect3D has nothing to
+  speed up there (at 100% zoom it draws: 486 to 1373 fps at 1080p with 4.3 beta 2 loaded). wkMapZoom 5 leaves the
+  drawing to wkDirect3D (see "Zoom").
 
 ## Install
 
@@ -89,7 +116,7 @@ Loaded together with wkDirect3D, each for a 20 second replay, with the picture c
 
 | Ran together, no crash | |
 |---|---|
-| Drawing and zoom | wkMapZoom 4.3 beta 2, wkFastDraw, wkVista 0.1.4, wkZoom 0.2.0, wkRGBA, wkJellyWorm (3.8.1 v1) |
+| Drawing and zoom | wkMapZoom 5.0 beta (its zoom is drawn by wkDirect3D) and 4.3 beta 2, wkSpeedometer 1.0, wkFastDraw, wkVista 0.1.4, wkZoom 0.2.0, wkRGBA, wkJellyWorm (3.8.1 v1) |
 | Modding | WormForge 0.9.9 |
 | Game and maps | wkRealTime 0.0.9.2, wkTerrainSync 1.2.6.1, wkTrackMeBetter 3.8.1, wkWall2Wall, wkPin 1.0.0.8, wkPlaceWorms, wkGolf, wkCrateEditor 1.0, wkRopeRaceDirection, wkTrackTime |
 | Controls, sound, menus | wkRemapKeys, wkVolumeControl, wkSuperFrontend, wkHelp, wkSetRes |
@@ -102,6 +129,19 @@ Two rules decide what happens when another module draws too:
   what it would add there is left out, and a notice on the screen says so for 15 seconds at the start of the game (and
   the log). wkMapZoom is the exception: its part is kept running.
 
+## For other modules
+
+wkDirect3D.dll exports a few functions (cdecl, to be called on WA's thread while WA draws a frame; find them with
+`GetModuleHandleA("wkDirect3D.dll")` and `GetProcAddress`). Their comments in [`src/wkDirect3D.c`](src/wkDirect3D.c)
+say exactly what each takes.
+
+- `wkDirect3D_Api()` returns the interface's number (1).
+- `wkDirect3D_Overlay(argb, w, h, pitch_bytes, x, y)` lays a true-colour picture (premultiplied A8R8G8B8) over the
+  finished frame; `wkDirect3D_Triangles(vertices, count)` does the same with coloured, see-through triangles. Both
+  return 0 when wkDirect3D is not drawing the frame, so the caller can draw into WA's own frame instead.
+- `wkDirect3D_MapMax`, `wkDirect3D_MapBegin`, `wkDirect3D_MapEnd` are the zoom's: a module has WA draw a map bigger
+  (or smaller) than the screen into a frame wkDirect3D hands out, and wkDirect3D puts it on the screen at a zoom.
+
 ## Not tested yet
 
 - **Fullscreen, live games and online games.** Replays in a window only so far. Nothing the module does touches the game
@@ -112,6 +152,7 @@ Two rules decide what happens when another module draws too:
 - **GOG's WA 3.8.1.** Steam's was used.
 - **The other drawing modules' own features** together with it: wkVista's zoom and full-colour maps, wkZoom's zoom,
   WormForge with mods on, wkRGBA with a full-colour map.
+- **The zoom on a weak graphics card.** The numbers above are from a fast one.
 
 If something looks wrong, switch it off (see Install) and please
 [open an issue](https://github.com/GermsWorms/wkDirect3D/issues) with the log.
@@ -122,6 +163,9 @@ If something looks wrong, switch it off (see Install) and please
   frame, so at very high frame rates that flick has to be quicker. Holding the left mouse button, Scroll Lock, WA's
   `CameraUnlockMouseSpeed` setting or vsync all get around it.
 - With wkFastDraw loaded too, both work: wkDirect3D draws the frames it can, and wkFastDraw speeds up the ones WA draws.
+- WA's own screenshots show the picture as drawn (zoomed too, then in WA's 256 colours), but not what other modules lay
+  over it through wkDirect3D (wkSpeedometer's dial). Videos made with WA's Export Video are drawn by WA and are not
+  zoomed.
 - One colour number (253) means "nothing here" in the frame WA's leftovers are drawn into. Something drawn by the CPU in
   exactly that number would not show. The check found no such pixel in any test.
 - As with every WormKit module, WA notes a scrambled checksum of the file in replays and sends it to the other players. WA

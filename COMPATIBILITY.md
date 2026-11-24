@@ -87,6 +87,29 @@ wkMapZoom's own test script with wkDirect3D loaded (0.3 beta): a resolution swit
 graphics objects when WA re-makes its frame) and the graphics device lost for 30 frames and made anew at 100% zoom
 (objects released, made again, wkDirect3D draws every frame again at 1500 to 1800 fps).
 
+## wkMapZoom 5.0 beta and wkSpeedometer 1.0 (wkDirect3D 0.4 beta)
+
+wkMapZoom 5 has no drawing of its own: wkDirect3D draws its zoomed map (README, "Zoom"). wkSpeedometer's dial and
+movement line are laid over the picture by wkDirect3D in true colour (or go into WA's frame in WA's colours when
+wkDirect3D is not there).
+
+| Loaded together (1280x720, full detail, `ttrr`, 20 s each) | fps | |
+|---|---|---|
+| wkMapZoom 5 alone | 903 | stays at 100% ("the zoom needs wkDirect3D" in its log) |
+| wkMapZoom 5 + wkDirect3D, 50% | 1551 | every frame zoomed, none refused |
+| wkSpeedometer alone | 889 | the dial in WA's colours |
+| wkSpeedometer + wkDirect3D | 1873 | the dial in true colour |
+| wkDirect3D, wkFastDraw, wkMapZoom 5, wkSpeedometer, wkRemapKeys, wkRealTime, 35% | 1323 | every frame zoomed |
+| the same with the auto zoom instead of a fixed zoom | 1510 | zooms in and out as it goes |
+| wkDirect3D, wkFastDraw, wkMapZoom 5, wkSpeedometer and nine more (wkRealTime, wkTerrainSync, wkTrackMeBetter, wkPin, wkVolumeControl, wkWall2Wall, wkSuperFrontend, wkRemapKeys), 35% | 1323 | every frame zoomed |
+
+Checked with the picture check on the zoomed map (every drawing call made again by WA alone at the map's full size,
+compared pixel by pixel): 25%, 35%, 38%, 50%, 70%, 150%, 200%, and a scripted zoom from 25% to 800% and back: 0
+pixels differ. A game played to its end while zoomed (with wkFastDraw and wkSpeedometer): WA closed by itself, no
+crash. A screenshot taken while zoomed shows the zoomed picture. No crash, no ERRORLOG.TXT in about 40 runs.
+
+wkMapZoom 4.3 beta 2 beside wkDirect3D 0.4 behaves as before (table below).
+
 ## How wkDirect3D keeps out of the way
 
 - It changes nothing when WA loads it; it puts its hooks in when the first game is on the screen, so modules that check

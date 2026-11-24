@@ -24,6 +24,12 @@
  * Nothing of the game's state is read for writing or changed: only what is shown. Log: %LOCALAPPDATA%\wkDirect3D\wkDirect3D.log.
  * Off switch: wkDirect3D.ini beside WA.exe, [wkDirect3D] Enabled=0.
  *
+ * For other modules (the exported functions near the end of this file): a zoom module (wkMapZoom 5) has WA draw the map
+ * bigger or smaller than the screen into a frame handed out here (wkDirect3D_MapBegin); that map is drawn as an ordinary
+ * frame is, into a target of its own, and put on the screen at the zoom, each screen pixel the average of the map
+ * pixels it covers (wkDirect3D_MapEnd). True-colour pictures and triangles can be laid over the finished frame
+ * (wkDirect3D_Overlay, wkDirect3D_Triangles: wkSpeedometer's dial and line).
+ *
  * Test switches (environment; for isolated test copies of WA): WKD3D_LOG=file, WKD3D_OFF=1 (hooks in, never drawing),
  * WKD3D_STATS=1 (a line a second), WKD3D_TRACE=n (n frames' drawing calls logged, from frame 400), WKD3D_SENT=n (the
  * "nothing here" index), WKD3D_TEST_ZOOM=0.35 (land, sky, back layers and fills drawn zoomed out about the screen's
@@ -56,7 +62,7 @@
 #include "image_guard.h"
 #include "shaders.h"
 
-#define VERSION "0.3 beta"
+#define VERSION "0.4 beta"
 #define WA_BASE 0x400000u
 #define VA(a) ((uintptr_t)(base + ((uintptr_t)(a) - WA_BASE)))
 #define P32(a) (*(uint32_t *)(uintptr_t)(a))
@@ -192,6 +198,7 @@ static int ww_age;                      /* frames since the write watch was last
 static uint8_t *ref;                    /* WKD3D_CHECK: the frame as WA's own code draws it */
 static int in_ref;                      /* ... and WA is drawing into it now (the module keeps out of the way) */
 static struct { unsigned frames, bad_frames; unsigned long long pixels, bad; } chk;
+static unsigned chk_maps;              /* ... of them zoomed frames' maps */
 static struct { uintptr_t surf; int x, y, w, h, sx, sy, flags, sw, sh, fresh; } chk_blit[4096];   /* this frame's blits and fills (surf 0) */
 static int chk_n;
 
@@ -201,7 +208,7 @@ static IDirect3DVertexBuffer9 *vb;
 static IDirect3DTexture9 *pal_tex, *ov_sys, *ov_tex, *ov_dyn, *rt_tex, *stage_tex;
 static IDirect3DSurface9 *ov_sys_lvl, *ov_lvl, *rt_lvl, *stage_lvl, *chk_surf, *back_rt, *back_sys;
 #define BACK 512                        /* the size of the pieces the index target is fetched back in */
-static IDirect3DPixelShader9 *sh_idx, *sh_final, *sh_rgb, *sh_avg[5];
+static IDirect3DPixelShader9 *sh_idx, *sh_final, *sh_rgb, *sh_avg[9], *sh_colour;
 static IDirect3DStateBlock9 *wa_state;  /* the device's state as WA left it */
 static IDirect3DTexture9 *ghost_tex;    /* a 1 x 1 frame texture and a vertex buffer of one point: WA's own show-frame */
 static IDirect3DVertexBuffer9 *ghost_vb; /* step run for the sake of other modules' hooks on it, drawing nothing */
@@ -215,6 +222,57 @@ static int note_drawn;                  /* the texture holds note_text */
 #define NOTE_W 640
 #define NOTE_H 44
 static int stage_w, stage_h, obj_w, obj_h, ov_dyn_h, states_mine;
+
+/* ---- the zoomed map (a zoom module asks for it through the exported functions near the end of this file) ----
+ * While WA draws the map part of a zoomed frame, everything above that describes "the frame" (the write-watched memory,
+ * the index target, the layer textures, the check's second frame) is the map's: as big as the largest zoomed-out view,
+ * and drawn 1:1 as ever. target_swap() exchanges the two sets. Then the map is put on the screen at the zoom, every
+ * screen pixel the average of the map pixels it covers, into a true-colour target of the screen's size; what WA draws
+ * after it (the HUD) goes straight into that target too, and it is what is shown. */
+typedef struct {
+    uint8_t *frame, *ref;
+    int w, h, dirty, ww_age;
+    size_t size;
+    void **ww_addr;
+    ULONG_PTR ww_cap;
+    IDirect3DTexture9 *ov_sys, *ov_tex, *rt_tex;
+    IDirect3DSurface9 *ov_sys_lvl, *ov_lvl, *rt_lvl, *chk_surf;
+} target;
+static target zmap;                     /* the map's set (while zm_on: the screen's, and the map's is in use) */
+static int zm_on;                       /* WA is drawing a zoomed frame's map part */
+static int zframe;                      /* this frame is a zoomed one: its screen part goes into zs in true colour */
+static int rt_used;                     /* something was drawn into the screen's index target this frame */
+static int zm_rw, zm_rh;                /* the part of the map target in use this frame */
+static int zm_deny_w, zm_deny_h;        /* a map target of this size could not be made */
+static double zm_zoom;                  /* (for the log) */
+static int zm_taps;
+static IDirect3DTexture9 *zs_tex;       /* a zoomed frame's picture: true colour, the screen's size */
+static IDirect3DSurface9 *zs_lvl, *zs_sys;
+static int zs_shown;                    /* the last frame shown was a zoomed one (a screenshot is taken from zs) */
+/* true-colour pictures and triangles other modules ask to have laid over the frame (the exported functions) */
+#define OVL_W 1024
+#define OVL_H 1024
+#define OVL_MAX 32
+#define TRI_MAX 190000
+typedef struct { float x, y, z, rhw; DWORD col; } tvert;
+static uint32_t *ovl_px;                /* this frame's pictures, side by side */
+static struct { int x, y, w, h, ax, ay; } ovl[OVL_MAX];
+static int n_ovl, ovl_x, ovl_y, ovl_shelf;
+static IDirect3DTexture9 *ovl_tex;
+static tvert *tri;
+static int n_tri, tri_cap;
+
+#define SWAP(T, a, b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
+static void target_swap(void) {
+    SWAP(uint8_t *, my_frame, zmap.frame); SWAP(uint8_t *, ref, zmap.ref);
+    SWAP(int, my_w, zmap.w); SWAP(int, my_h, zmap.h); SWAP(int, my_dirty, zmap.dirty); SWAP(int, ww_age, zmap.ww_age);
+    SWAP(size_t, my_size, zmap.size); SWAP(void **, ww_addr, zmap.ww_addr); SWAP(ULONG_PTR, ww_cap, zmap.ww_cap);
+    SWAP(IDirect3DTexture9 *, ov_sys, zmap.ov_sys); SWAP(IDirect3DTexture9 *, ov_tex, zmap.ov_tex);
+    SWAP(IDirect3DTexture9 *, rt_tex, zmap.rt_tex);
+    SWAP(IDirect3DSurface9 *, ov_sys_lvl, zmap.ov_sys_lvl); SWAP(IDirect3DSurface9 *, ov_lvl, zmap.ov_lvl);
+    SWAP(IDirect3DSurface9 *, rt_lvl, zmap.rt_lvl); SWAP(IDirect3DSurface9 *, chk_surf, zmap.chk_surf);
+    zm_on = !zm_on;
+}
 static uint32_t pal_gen_shown = 0xffffffffu;
 #define VB_QUADS 4096
 /* a noted rectangle: where on the screen, what (the vertex colour), from where in which texture (NULL: none needed) */
@@ -334,9 +392,21 @@ static void restore_states(void) {
     states_mine = 0;
 }
 
+/* the map's Direct3D objects (its memory is kept) */
+static void map_release(void) {
+    if (zm_on) target_swap();
+    REL(zmap.ov_sys_lvl); REL(zmap.ov_lvl); REL(zmap.rt_lvl); REL(zmap.chk_surf);
+    REL(zmap.ov_sys); REL(zmap.ov_tex); REL(zmap.rt_tex);
+    REL(zs_lvl); REL(zs_sys); REL(zs_tex);
+    zframe = 0; zs_shown = 0;
+}
+
 static void release_objects(const char *why) {
     if (!obj_dev) return;
     restore_states();
+    map_release();
+    REL(ovl_tex); REL(sh_colour);
+    n_ovl = n_tri = 0;
     tc_release_all();
     REL(wa_state); REL(vb); REL(pal_tex); REL(ghost_tex); REL(ghost_vb); REL(note_tex); REL(sh_plain);
     note_drawn = 0;
@@ -347,7 +417,7 @@ static void release_objects(const char *why) {
     sp_bits = NULL; sp_x = sp_y = sp_shelf = 0; sp_d0 = SP_H; sp_d1 = 0;
     REL(sp_sys_lvl); REL(sp_lvl); REL(sp_sys); REL(sp_tex);
     REL(sh_idx); REL(sh_final); REL(sh_rgb);
-    REL(sh_avg[2]); REL(sh_avg[3]); REL(sh_avg[4]);
+    REL(sh_avg[2]); REL(sh_avg[3]); REL(sh_avg[4]); REL(sh_avg[6]); REL(sh_avg[8]);
     stage_w = stage_h = 0;
     obj_dev = NULL;
     pal_gen_shown = 0xffffffffu;
@@ -395,6 +465,7 @@ static int make_objects(IDirect3DDevice9 *dev, int w, int h) {
     TRY(IDirect3DDevice9_CreatePixelShader(dev, ps_final, &sh_final), "shader");
     TRY(IDirect3DDevice9_CreatePixelShader(dev, ps_rgb_any, &sh_rgb), "shader");
     TRY(IDirect3DDevice9_CreatePixelShader(dev, ps_plain, &sh_plain), "shader");
+    TRY(IDirect3DDevice9_CreatePixelShader(dev, ps_colour, &sh_colour), "shader");
 #undef TRY
     if (FAILED(hr)) {
         say("Direct3D: no %s (%08lx): WA draws by itself", what, (unsigned long)hr);
@@ -405,6 +476,8 @@ static int make_objects(IDirect3DDevice9 *dev, int w, int h) {
         IDirect3DDevice9_CreatePixelShader(dev, ps_avg2, &sh_avg[2]);
         IDirect3DDevice9_CreatePixelShader(dev, ps_avg3, &sh_avg[3]);
         IDirect3DDevice9_CreatePixelShader(dev, ps_avg4, &sh_avg[4]);
+        if (FAILED(IDirect3DDevice9_CreatePixelShader(dev, ps_avg6, &sh_avg[6]))) sh_avg[6] = NULL;
+        if (FAILED(IDirect3DDevice9_CreatePixelShader(dev, ps_avg8, &sh_avg[8]))) sh_avg[8] = NULL;
     }
     IDirect3DTexture9_GetSurfaceLevel(ov_sys, 0, &ov_sys_lvl);
     IDirect3DTexture9_GetSurfaceLevel(ov_tex, 0, &ov_lvl);
@@ -564,7 +637,8 @@ static void sprite_upload(IDirect3DDevice9 *dev) {
 /* the noted rectangles, drawn in their order (into the index target, or zoomed frames: onto the back buffer); those
  * that follow each other from one texture in one call */
 static void draw_ops(IDirect3DDevice9 *dev) {
-    const int zoomed = test_zoom != 1.0;
+    const int zoomed = test_zoom != 1.0;      /* (the zoom speed test: straight onto the back buffer) */
+    const int rgb = zframe && !zm_on && !zoomed;   /* a zoomed frame's screen part: in true colour into its own target */
     const LONGLONG t0 = now();
     IDirect3DSurface9 *bb = NULL;
     IDirect3DTexture9 *cur = NULL;
@@ -573,16 +647,15 @@ static void draw_ops(IDirect3DDevice9 *dev) {
     if (!n_ops) return;
     set_states(dev);
     sprite_upload(dev);
-    if (zoomed) {
-        update_palette();
-        if (zoom_clear) { zoom_clear = 0; IDirect3DDevice9_Clear(dev, 0, NULL, D3DCLEAR_TARGET, 0, 1.0f, 0); }
-    }
+    if (zoomed || rgb) update_palette();
+    if (zoomed && zoom_clear) { zoom_clear = 0; IDirect3DDevice9_Clear(dev, 0, NULL, D3DCLEAR_TARGET, 0, 1.0f, 0); }
     if (FAILED(IDirect3DVertexBuffer9_Lock(vb, 0, (UINT)(n_ops * 6 * sizeof(vert)), (void **)&v, D3DLOCK_DISCARD))) { frame_abort = 1; n_ops = 0; return; }
     for (i = 0; i < n_ops; i++) put_quad(v + 6 * i, &ops[i]);
     IDirect3DVertexBuffer9_Unlock(vb);
     if (!zoomed) {
         IDirect3DDevice9_GetRenderTarget(dev, 0, &bb);
-        IDirect3DDevice9_SetRenderTarget(dev, 0, rt_lvl);
+        IDirect3DDevice9_SetRenderTarget(dev, 0, rgb ? zs_lvl : rt_lvl);
+        if (!rgb && !zm_on) rt_used = 1;
     }
     IDirect3DDevice9_BeginScene(dev);
     IDirect3DDevice9_SetTexture(dev, 1, (IDirect3DBaseTexture9 *)pal_tex);
@@ -597,7 +670,8 @@ static void draw_ops(IDirect3DDevice9 *dev) {
             else if (ops[i].tex != tex) break;
         }
         if (tex && tex != cur) { IDirect3DDevice9_SetTexture(dev, 0, (IDirect3DBaseTexture9 *)tex); cur = tex; }
-        if (!zoomed) IDirect3DDevice9_SetPixelShader(dev, sh_idx);
+        if (rgb) IDirect3DDevice9_SetPixelShader(dev, sh_rgb);
+        else if (!zoomed) IDirect3DDevice9_SetPixelShader(dev, sh_idx);
         else if (!o->zoom) IDirect3DDevice9_SetPixelShader(dev, sh_rgb);
         else {
             const int n = test_zoom <= 0.3 ? 4 : test_zoom <= 0.55 ? 3 : 2;
@@ -701,6 +775,8 @@ static void swap_out(void) {
 }
 static void go_passive(const char *why) {
     if (mode != ACTIVE) return;
+    if (zm_on) { target_swap(); zmap.dirty = 1; }
+    zframe = 0; rt_used = 0;
     swap_out();
     mode = PASSIVE;
     my_dirty = 1;
@@ -795,7 +871,7 @@ static void take_layer(IDirect3DDevice9 *dev, int last) {
     if (nr && !frame_abort) {
         draw_ops(dev);                      /* (what the GPU drew before WA drew this lies under it) */
         t1 = now();
-        if (!opt_ov) {                      /* a frame-sized texture, each piece updated in its own place */
+        if (!opt_ov || zm_on) {             /* a frame-sized texture, each piece updated in its own place */
             if (FAILED(IDirect3DTexture9_LockRect(ov_sys, 0, &lr, NULL, D3DLOCK_NO_DIRTY_UPDATE))) { frame_abort = 1; return; }
             for (k = 0; k < nr; k++) {
                 const int w = rects[k].right - rects[k].left;
@@ -1120,7 +1196,7 @@ void __cdecl disp_enter(uint32_t *f, int k) {
     dsp++;
     c->ret = ret; c->touch = cpu_touch; c->disp = d; c->region = 0; c->again = 0;
     if (in_ref) { f[8] = (uint32_t)(uintptr_t)disp_back[k]; c->cpu = 0; return; }   /* (inside the second call: WA's own, untouched) */
-    if (ref && opt_strict && dsp == 1 && mine_now() && !frame_abort && test_zoom == 1.0) {
+    if (ref && opt_strict && dsp == 1 && mine_now() && !frame_abort && test_zoom == 1.0 && (!zframe || zm_on)) {
         memcpy(c->args, a, sizeof(c->args));
         c->argp = (uintptr_t)a;
         c->again = 1;
@@ -1223,12 +1299,19 @@ void __cdecl note_frame_change(uintptr_t rc) { (void)rc; go_passive("WA re-makes
  * too, but then the module is passive). The frame the module gave WA holds only what WA drew itself, so the whole
  * picture is fetched into it from the index target first; afterwards it is "nothing" again. */
 static int read_filled;
+static int fetch_zs(IDirect3DDevice9 *dev);
 void __cdecl note_read(uintptr_t rc) {
     IDirect3DDevice9 *dev;
     (void)rc;
     if (mode != ACTIVE || in_ref || read_filled || P32(VA(FRAME_PTR_VA)) != (uint32_t)(uintptr_t)my_frame || n_ops || frame_ops) return;
     dev = device_now();
     frame_abort = 0;                        /* (asked between frames: no frame to give up) */
+    if (dev && zs_shown) {                  /* a zoomed frame: its true-colour picture, as the palette's nearest colours */
+        if (!fetch_zs(dev)) { say("a screenshot is being taken, but the zoomed picture could not be fetched from the GPU: it will be wrong"); return; }
+        read_filled = 1;
+        say("WA reads its frame (a screenshot): the zoomed picture was fetched from the GPU for it, in the palette's nearest colours");
+        return;
+    }
     if (!dev || !fetch_under(dev, 0, 0, my_w, my_h)) { say("a screenshot is being taken, but the picture could not be fetched from the GPU: it will be wrong"); return; }
     read_filled = 1;
     if (ref && opt_strict) {                /* (the check: against WA's own picture of the same frame) */
@@ -1262,15 +1345,16 @@ NOTE_THUNK(thunk_rc_read_end, note_read_end, orig_rc_read_end)
 static void check_frame(IDirect3DDevice9 *dev) {
     D3DLOCKED_RECT lr;
     unsigned long long bad = 0;
+    const int cw = zm_on ? zm_rw : my_w, ch = zm_on ? zm_rh : my_h;   /* (of the map: the part in use) */
     int x, y, k, fx = -1, fy = -1, fa = 0, fb = 0, bx0 = 1 << 30, by0 = 1 << 30, bx1 = -1, by1 = -1;
     if (FAILED(IDirect3DDevice9_GetRenderTargetData(dev, rt_lvl, chk_surf)) || FAILED(IDirect3DSurface9_LockRect(chk_surf, &lr, NULL, D3DLOCK_READONLY))) {
         say("check: the index target can't be read back");
         return;
     }
-    for (y = 0; y < my_h; y++) {
+    for (y = 0; y < ch; y++) {
         const uint32_t *g = (const uint32_t *)((const uint8_t *)lr.pBits + (size_t)y * lr.Pitch);
         const uint8_t *r = ref + (size_t)y * my_w;
-        for (x = 0; x < my_w; x++) if ((uint8_t)g[x] != r[x]) {
+        for (x = 0; x < cw; x++) if ((uint8_t)g[x] != r[x]) {
             if (!bad) { fx = x; fy = y; fa = (uint8_t)g[x]; fb = r[x]; }
             if (x < bx0) bx0 = x;
             if (x > bx1) bx1 = x;
@@ -1291,7 +1375,8 @@ static void check_frame(IDirect3DDevice9 *dev) {
         }
     }
     IDirect3DSurface9_UnlockRect(chk_surf);
-    chk.frames++; chk.pixels += (unsigned long long)my_w * my_h; chk.bad += bad;
+    chk.frames++; chk.pixels += (unsigned long long)cw * ch; chk.bad += bad;
+    if (zm_on) chk_maps++;
     if (bad) {
         chk.bad_frames++;
         if (chk.bad_frames <= 20) {
@@ -1309,7 +1394,7 @@ static void check_frame(IDirect3DDevice9 *dev) {
             }
         }
     }
-    if (chk.frames % 200 == 0) say("check: %u frames compared, %u with differences, %llu of %llu pixels differ", chk.frames, chk.bad_frames, chk.bad, chk.pixels);
+    if (chk.frames % 200 == 0) say("check: %u frames compared (%u of them zoomed maps), %u with differences, %llu of %llu pixels differ", chk.frames, chk_maps, chk.bad_frames, chk.bad, chk.pixels);
 }
 
 /* the notice: said in the log, and shown over the picture for 15 seconds of the frames this module draws */
@@ -1382,6 +1467,339 @@ static void draw_notice(IDirect3DDevice9 *dev) {
     IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, 0);
     IDirect3DDevice9_SetTexture(dev, 0, NULL);
     IDirect3DDevice9_EndScene(dev);
+}
+
+/* ---- the zoomed map: its target, and how it gets onto the screen ---- */
+/* one rectangle over the whole of the target in use, from the whole of a texture, through a shader */
+static void whole_quad(IDirect3DDevice9 *dev, IDirect3DTexture9 *tex, IDirect3DPixelShader9 *sh) {
+    gop o;
+    vert *v;
+    memset(&o, 0, sizeof(o));
+    o.x1 = (float)obj_w; o.y1 = (float)obj_h; o.u1 = o.v1 = 1; o.l2 = o.l3 = 1;
+    update_palette();
+    set_states(dev);
+    if (FAILED(IDirect3DVertexBuffer9_Lock(vb, 0, 6 * sizeof(vert), (void **)&v, D3DLOCK_DISCARD))) return;
+    put_quad(v, &o);
+    IDirect3DVertexBuffer9_Unlock(vb);
+    IDirect3DDevice9_BeginScene(dev);
+    IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, 0);
+    IDirect3DDevice9_SetTexture(dev, 0, (IDirect3DBaseTexture9 *)tex);
+    IDirect3DDevice9_SetTexture(dev, 1, (IDirect3DBaseTexture9 *)pal_tex);
+    IDirect3DDevice9_SetPixelShader(dev, sh);
+    IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLELIST, 0, 2);
+    IDirect3DDevice9_SetTexture(dev, 0, NULL);
+    IDirect3DDevice9_EndScene(dev);
+}
+
+/* the map's frame and Direct3D objects for a map of w x h (the screen's set in place); 0: not to be had */
+static int map_make(IDirect3DDevice9 *dev, int w, int h) {
+    D3DCAPS9 caps;
+    HRESULT hr = 0;
+    const char *what = "";
+    if (zmap.rt_tex && zs_tex && zmap.frame && zmap.w == w && zmap.h == h) return 1;
+    if (zm_deny_w && w >= zm_deny_w && h >= zm_deny_h) return 0;
+    map_release();
+    memset(&caps, 0, sizeof(caps));
+    IDirect3DDevice9_GetDeviceCaps(dev, &caps);
+    if (!sh_avg[2] || !sh_avg[3] || !sh_avg[4] || (DWORD)w > caps.MaxTextureWidth || (DWORD)h > caps.MaxTextureHeight) {
+        if (!zm_deny_w) say("zoom: no map target of %dx%d on this graphics device (textures up to %lux%lu%s)", w, h, caps.MaxTextureWidth,
+                            caps.MaxTextureHeight, sh_avg[4] ? "" : "; no pixel shader 3.0");
+        zm_deny_w = w; zm_deny_h = h;
+        return 0;
+    }
+    if (!zmap.frame || zmap.w != w || zmap.h != h) {
+        const size_t size = ((size_t)w * h + 4095) / 4096 * 4096;
+        if (zmap.frame) VirtualFree(zmap.frame, 0, MEM_RELEASE);
+        free(zmap.ww_addr); free(zmap.ref);
+        memset(&zmap, 0, sizeof(zmap));
+        zmap.frame = (uint8_t *)VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+        zmap.ww_cap = size / 4096;
+        zmap.ww_addr = (void **)malloc(zmap.ww_cap * sizeof(void *));
+        zmap.ref = opt_check && zmap.frame ? (uint8_t *)calloc(size, 1) : NULL;
+        if (!zmap.frame || !zmap.ww_addr || (opt_check && !zmap.ref)) {
+            say("zoom: no memory for a %dx%d map frame (error %lu)", w, h, GetLastError());
+            if (zmap.frame) VirtualFree(zmap.frame, 0, MEM_RELEASE);
+            free(zmap.ww_addr); free(zmap.ref);
+            memset(&zmap, 0, sizeof(zmap));
+            zm_deny_w = w; zm_deny_h = h;
+            return 0;
+        }
+        zmap.w = w; zmap.h = h; zmap.size = size;
+        memset(zmap.frame, sent, size);
+        ResetWriteWatch(zmap.frame, size);
+    }
+#define TRY(x, name) if (!FAILED(hr)) { hr = (x); if (FAILED(hr)) what = name; }
+    TRY(IDirect3DDevice9_CreateTexture(dev, w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &zmap.rt_tex, NULL), "map target");
+    TRY(IDirect3DDevice9_CreateTexture(dev, w, h, 1, 0, D3DFMT_L8, D3DPOOL_SYSTEMMEM, &zmap.ov_sys, NULL), "map layer staging");
+    TRY(IDirect3DDevice9_CreateTexture(dev, w, h, 1, 0, D3DFMT_L8, D3DPOOL_DEFAULT, &zmap.ov_tex, NULL), "map layer texture");
+    TRY(IDirect3DDevice9_CreateTexture(dev, obj_w, obj_h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &zs_tex, NULL), "true-colour target");
+    if (opt_check) TRY(IDirect3DDevice9_CreateOffscreenPlainSurface(dev, w, h, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &zmap.chk_surf, NULL), "check surface");
+#undef TRY
+    if (FAILED(hr)) {
+        say("zoom: no %s for a %dx%d map (%08lx)", what, w, h, (unsigned long)hr);
+        map_release();
+        zm_deny_w = w; zm_deny_h = h;
+        return 0;
+    }
+    IDirect3DTexture9_GetSurfaceLevel(zmap.rt_tex, 0, &zmap.rt_lvl);
+    IDirect3DTexture9_GetSurfaceLevel(zmap.ov_sys, 0, &zmap.ov_sys_lvl);
+    IDirect3DTexture9_GetSurfaceLevel(zmap.ov_tex, 0, &zmap.ov_lvl);
+    IDirect3DTexture9_GetSurfaceLevel(zs_tex, 0, &zs_lvl);
+    IDirect3DDevice9_ColorFill(dev, zmap.rt_lvl, NULL, 0);
+    IDirect3DDevice9_ColorFill(dev, zs_lvl, NULL, 0);
+    zmap.dirty = 1;
+    say("zoom: map target made, %dx%d (%u MB on the graphics card, %u MB of memory)", w, h, (unsigned)(((size_t)w * h * 5 + (size_t)obj_w * obj_h * 4) >> 20),
+        (unsigned)(((size_t)w * h * (opt_check ? 7 : 2)) >> 20));
+    return 1;
+}
+
+/* the screen's picture so far into the true-colour target (the zoomed frame starts there) */
+static void screen_to_zs(IDirect3DDevice9 *dev) {
+    IDirect3DSurface9 *bb = NULL;
+    set_states(dev);
+    IDirect3DDevice9_GetRenderTarget(dev, 0, &bb);
+    IDirect3DDevice9_SetRenderTarget(dev, 0, zs_lvl);
+    if (rt_used) whole_quad(dev, rt_tex, sh_final);
+    else IDirect3DDevice9_Clear(dev, 0, NULL, D3DCLEAR_TARGET, 0, 1.0f, 0);
+    if (bb) { IDirect3DDevice9_SetRenderTarget(dev, 0, bb); IDirect3DSurface9_Release(bb); }
+}
+
+/* how the map lies on the screen (the zoom module's words: zoom_math.h's): map point bx, by is at screen point ox, oy,
+ * `zoom` screen pixels a map pixel, shown within x1, y1 .. x2, y2 */
+typedef struct { int size; double zoom; int bx, by, ox, oy, x1, y1, x2, y2, smooth; } wkd3d_view;
+
+static int map_to_screen(IDirect3DDevice9 *dev, const wkd3d_view *v) {
+    const double z = v->zoom;
+    const float w = (float)zmap.w, h = (float)zmap.h;   /* (the map's set is back in zmap) */
+    int x1 = v->x1 < 0 ? 0 : v->x1, y1 = v->y1 < 0 ? 0 : v->y1, x2 = v->x2 > obj_w ? obj_w : v->x2, y2 = v->y2 > obj_h ? obj_h : v->y2;
+    int n = z >= 1.0 ? 2 : (int)ceil(1.0 / z - 0.02);
+    IDirect3DPixelShader9 *sh;
+    IDirect3DSurface9 *bb = NULL;
+    float c[4] = {0, 0, 0, 0};
+    gop o;
+    vert *q;
+    if (x2 <= x1 || y2 <= y1 || !zmap.rt_tex || !zs_lvl) return 0;
+    n = n <= 2 ? 2 : n == 3 ? 3 : n == 4 ? 4 : n <= 6 ? 6 : 8;   /* samples each way: one for every map pixel a screen pixel covers */
+    while (n > 2 && !sh_avg[n]) n = n == 8 ? 6 : n == 6 ? 4 : n - 1;
+    sh = v->smooth ? sh_avg[n] : sh_rgb;
+    zm_zoom = z; zm_taps = v->smooth ? n : 1;
+    memset(&o, 0, sizeof(o));
+    o.col = COL_OPAQUE;
+    o.x0 = (float)x1; o.y0 = (float)y1; o.x1 = (float)x2; o.y1 = (float)y2;
+    o.u0 = (float)((v->bx + (x1 - v->ox) / z) / w); o.u1 = (float)((v->bx + (x2 - v->ox) / z) / w);
+    o.v0 = (float)((v->by + (y1 - v->oy) / z) / h); o.v1 = (float)((v->by + (y2 - v->oy) / z) / h);
+    o.l0 = 0.5f / w; o.l1 = 0.5f / h; o.l2 = (zm_rw - 0.5f) / w; o.l3 = (zm_rh - 0.5f) / h;
+    c[0] = (float)(1.0 / z / w); c[1] = (float)(1.0 / z / h);
+    update_palette();
+    set_states(dev);
+    if (FAILED(IDirect3DVertexBuffer9_Lock(vb, 0, 6 * sizeof(vert), (void **)&q, D3DLOCK_DISCARD))) return 0;
+    put_quad(q, &o);
+    IDirect3DVertexBuffer9_Unlock(vb);
+    IDirect3DDevice9_GetRenderTarget(dev, 0, &bb);
+    IDirect3DDevice9_SetRenderTarget(dev, 0, zs_lvl);
+    IDirect3DDevice9_BeginScene(dev);
+    IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, 0);
+    IDirect3DDevice9_SetTexture(dev, 0, (IDirect3DBaseTexture9 *)zmap.rt_tex);
+    IDirect3DDevice9_SetTexture(dev, 1, (IDirect3DBaseTexture9 *)pal_tex);
+    IDirect3DDevice9_SetPixelShaderConstantF(dev, 1, c, 1);
+    IDirect3DDevice9_SetPixelShader(dev, sh);
+    IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLELIST, 0, 2);
+    IDirect3DDevice9_SetTexture(dev, 0, NULL);
+    IDirect3DDevice9_EndScene(dev);
+    if (bb) { IDirect3DDevice9_SetRenderTarget(dev, 0, bb); IDirect3DSurface9_Release(bb); }
+    st.draws++;
+    return 1;
+}
+
+/* a zoomed frame's true-colour picture into the frame WA reads (a screenshot), as the palette's nearest colours */
+static int fetch_zs(IDirect3DDevice9 *dev) {
+    static uint8_t pal_was[1024];
+    static uint16_t *lut;                   /* by 5 bits of red, green and blue: the nearest index (0xffff: not worked out yet) */
+    const uint8_t *pal = (const uint8_t *)VA(PAL_VA);
+    D3DLOCKED_RECT lr;
+    int x, y, i;
+    if (!zs_lvl || !my_frame) return 0;
+    if (!zs_sys && FAILED(IDirect3DDevice9_CreateOffscreenPlainSurface(dev, obj_w, obj_h, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &zs_sys, NULL))) { zs_sys = NULL; return 0; }
+    if (!lut || memcmp(pal_was, pal, sizeof(pal_was))) {
+        if (!lut) lut = (uint16_t *)malloc(32768 * sizeof(uint16_t));
+        if (!lut) return 0;
+        memset(lut, 0xff, 32768 * sizeof(uint16_t));
+        memcpy(pal_was, pal, sizeof(pal_was));
+    }
+    if (FAILED(IDirect3DDevice9_GetRenderTargetData(dev, zs_lvl, zs_sys)) || FAILED(IDirect3DSurface9_LockRect(zs_sys, &lr, NULL, D3DLOCK_READONLY))) return 0;
+    for (y = 0; y < my_h && y < obj_h; y++) {
+        const uint32_t *row = (const uint32_t *)((const uint8_t *)lr.pBits + (size_t)y * lr.Pitch);
+        uint8_t *to = my_frame + (size_t)y * my_w;
+        for (x = 0; x < my_w && x < obj_w; x++) {
+            const uint32_t px = row[x];
+            const int r = (px >> 16) & 255, g = (px >> 8) & 255, b = px & 255, k = (r >> 3) << 10 | (g >> 3) << 5 | b >> 3;
+            if (lut[k] == 0xffff) {
+                const int cr = (r & 0xf8) | 4, cg = (g & 0xf8) | 4, cb = (b & 0xf8) | 4;
+                long best = 1L << 30;
+                for (i = 0; i < 256; i++) {
+                    const long dr = pal[4 * i] - cr, dg = pal[4 * i + 1] - cg, db = pal[4 * i + 2] - cb, d = dr * dr + dg * dg + db * db;
+                    if (d < best) { best = d; lut[k] = (uint16_t)i; }
+                }
+            }
+            to[x] = (uint8_t)lut[k];
+        }
+    }
+    IDirect3DSurface9_UnlockRect(zs_sys);
+    return 1;
+}
+
+/* the pictures and triangles other modules asked for this frame, over the finished picture (the back buffer) */
+static void draw_overlays(IDirect3DDevice9 *dev) {
+    if (n_tri && tri && sh_colour) {
+        set_states(dev);
+        IDirect3DDevice9_BeginScene(dev);
+        IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, 1);
+        IDirect3DDevice9_SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        IDirect3DDevice9_SetTexture(dev, 0, NULL);
+        IDirect3DDevice9_SetPixelShader(dev, sh_colour);
+        IDirect3DDevice9_SetFVF(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+        IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, (UINT)(n_tri / 3), tri, sizeof(tvert));
+        IDirect3DDevice9_SetFVF(dev, FVF);  /* (drawing from memory leaves no vertex buffer set) */
+        IDirect3DDevice9_SetStreamSource(dev, 0, vb, 0, sizeof(vert));
+        IDirect3DDevice9_SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_ONE);
+        IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, 0);
+        IDirect3DDevice9_EndScene(dev);
+    }
+    if (n_ovl && ovl_px && sh_plain) {
+        D3DLOCKED_RECT lr;
+        const int rows = ovl_y + ovl_shelf;
+        vert *v;
+        int i, y;
+        if (!ovl_tex && FAILED(IDirect3DDevice9_CreateTexture(dev, OVL_W, OVL_H, 1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &ovl_tex, NULL))) ovl_tex = NULL;
+        if (ovl_tex && !FAILED(IDirect3DTexture9_LockRect(ovl_tex, 0, &lr, NULL, D3DLOCK_DISCARD))) {
+            for (y = 0; y < rows; y++) memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch, ovl_px + (size_t)y * OVL_W, OVL_W * 4);
+            IDirect3DTexture9_UnlockRect(ovl_tex, 0);
+            set_states(dev);
+            if (!FAILED(IDirect3DVertexBuffer9_Lock(vb, 0, (UINT)(n_ovl * 6 * sizeof(vert)), (void **)&v, D3DLOCK_DISCARD))) {
+                for (i = 0; i < n_ovl; i++) {
+                    gop o;
+                    memset(&o, 0, sizeof(o));
+                    o.x0 = (float)ovl[i].x; o.y0 = (float)ovl[i].y; o.x1 = (float)(ovl[i].x + ovl[i].w); o.y1 = (float)(ovl[i].y + ovl[i].h);
+                    o.u0 = (float)ovl[i].ax / OVL_W; o.v0 = (float)ovl[i].ay / OVL_H;
+                    o.u1 = (float)(ovl[i].ax + ovl[i].w) / OVL_W; o.v1 = (float)(ovl[i].ay + ovl[i].h) / OVL_H;
+                    o.l2 = o.l3 = 1;
+                    put_quad(v + 6 * i, &o);
+                }
+                IDirect3DVertexBuffer9_Unlock(vb);
+                IDirect3DDevice9_BeginScene(dev);
+                IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, 1);   /* (premultiplied: one, 1 - alpha) */
+                IDirect3DDevice9_SetTexture(dev, 0, (IDirect3DBaseTexture9 *)ovl_tex);
+                IDirect3DDevice9_SetPixelShader(dev, sh_plain);
+                IDirect3DDevice9_DrawPrimitive(dev, D3DPT_TRIANGLELIST, 0, (UINT)(n_ovl * 2));
+                IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, 0);
+                IDirect3DDevice9_SetTexture(dev, 0, NULL);
+                IDirect3DDevice9_EndScene(dev);
+            }
+        }
+    }
+    n_ovl = n_tri = 0; ovl_x = ovl_y = ovl_shelf = 0;
+}
+
+/* ---- what other modules can ask for (exported; all on WA's own thread, while WA draws a frame) ---- */
+#define WKD3D_API __declspec(dllexport)
+static int drawing_now(void) { return mode == ACTIVE && !frame_abort && !in_ref && obj_dev && my_frame && (zm_on || mine_now()); }
+
+WKD3D_API int __cdecl wkDirect3D_Api(void) { return 1; }
+
+/* The largest map (see MapBegin) that can be drawn now. 0: none (this module is not drawing, or the graphics device
+ * cannot do it) */
+WKD3D_API int __cdecl wkDirect3D_MapMax(int *max_w, int *max_h) {
+    D3DCAPS9 caps;
+    int w, h;
+    if (mode != ACTIVE || !obj_dev || !sh_avg[2] || !sh_avg[3] || !sh_avg[4] || test_zoom != 1.0) return 0;
+    memset(&caps, 0, sizeof(caps));
+    IDirect3DDevice9_GetDeviceCaps(obj_dev, &caps);
+    w = (int)caps.MaxTextureWidth; h = (int)caps.MaxTextureHeight;
+    if (zm_deny_w && w >= zm_deny_w) w = zm_deny_w - 2;
+    if (zm_deny_h && h >= zm_deny_h) h = zm_deny_h - 2;
+    if (w < obj_w || h < obj_h) return 0;
+    if (max_w) *max_w = w;
+    if (max_h) *max_h = h;
+    return 1;
+}
+
+/* A zoomed frame's map part begins. The caller then makes WA's display and frame describe a map of rw x rh pixels in a
+ * frame of `stride` bytes a row and `rows` rows (the largest map it will ever ask for: the same every frame), at the
+ * address this returns, and has WA draw the map into it at WA's own scale. NULL: not this frame (draw it unzoomed). */
+WKD3D_API void *__cdecl wkDirect3D_MapBegin(int stride, int rows, int rw, int rh) {
+    IDirect3DDevice9 *dev;
+    if (zm_on || in_ref || read_filled || test_zoom != 1.0 || frame_abort || !mine_now()) return NULL;
+    if (stride < 64 || rows < 64 || rw < 1 || rh < 1 || rw > stride || rh > rows) return NULL;
+    dev = device_now();
+    if (!dev || !map_make(dev, stride, rows)) return NULL;
+    if (cpu_maybe) { take_layer(dev, 0); cpu_maybe = 0; }   /* what is drawn so far lies under the map */
+    draw_ops(dev);
+    if (frame_abort) return NULL;
+    if (!zframe) { screen_to_zs(dev); zframe = 1; }
+    target_swap();
+    frame_clean();
+    zm_rw = rw; zm_rh = rh;
+    cpu_maybe = 0;
+    return my_frame;
+}
+
+/* The map part is drawn: it is put on the screen as `view` says. What WA draws after this (the caller has given the
+ * display and the frame back first or does so now) lies over it at the screen's own scale. 0: it could not be done
+ * (this frame is lost: WA shows what it has) */
+WKD3D_API int __cdecl wkDirect3D_MapEnd(const wkd3d_view *view) {
+    IDirect3DDevice9 *dev;
+    int ok = 0;
+    if (!zm_on) return 0;
+    dev = frame_abort ? NULL : device_now();
+    if (dev) { take_layer(dev, 1); draw_ops(dev); }
+    if (dev && !frame_abort && ref && chk_surf && opt_check && frames % (unsigned)opt_check == 0) check_frame(dev);
+    target_swap();
+    cpu_maybe = 0;
+    if (dev && !frame_abort && view && view->size >= (int)sizeof(*view) && view->zoom > 0.01) ok = map_to_screen(dev, view);
+    if (!ok) { frame_abort = 1; zmap.dirty = 1; }
+    return ok;
+}
+
+/* A true-colour picture laid over the finished picture of the frame being drawn: premultiplied A8R8G8B8, h rows of
+ * pitch_bytes bytes, its top left at screen point x, y. The pixels are copied. 1: it will be drawn; 0: this module is
+ * not drawing this frame (or there is no room left this frame): draw it yourself. */
+WKD3D_API int __cdecl wkDirect3D_Overlay(const uint32_t *argb, int w, int h, int pitch_bytes, int x, int y) {
+    int r;
+    if (!drawing_now() || !argb || w < 1 || h < 1 || w > OVL_W || pitch_bytes < w * 4 || n_ovl == OVL_MAX) return 0;
+    if (!ovl_px) ovl_px = (uint32_t *)malloc((size_t)OVL_W * OVL_H * 4);
+    if (!ovl_px) return 0;
+    if (ovl_x + w > OVL_W) { ovl_y += ovl_shelf; ovl_x = 0; ovl_shelf = 0; }
+    if (ovl_y + h > OVL_H) return 0;
+    for (r = 0; r < h; r++) memcpy(ovl_px + (size_t)(ovl_y + r) * OVL_W + ovl_x, (const uint8_t *)argb + (size_t)r * pitch_bytes, (size_t)w * 4);
+    ovl[n_ovl].x = x; ovl[n_ovl].y = y; ovl[n_ovl].w = w; ovl[n_ovl].h = h; ovl[n_ovl].ax = ovl_x; ovl[n_ovl].ay = ovl_y;
+    n_ovl++;
+    ovl_x += w;
+    if (h > ovl_shelf) ovl_shelf = h;
+    return 1;
+}
+
+/* Triangles laid over the finished picture the same way: `count` vertices (three a triangle) in screen pixels, each
+ * with a colour of its own (A8R8G8B8, alpha not premultiplied), blended in. 1 / 0 as above; at most 190000 vertices a
+ * frame (what is over is left out). */
+typedef struct { float x, y; uint32_t argb; } wkd3d_vtx;
+WKD3D_API int __cdecl wkDirect3D_Triangles(const wkd3d_vtx *v, int count) {
+    int i;
+    if (!drawing_now() || !v || count < 3 || !sh_colour) return 0;
+    count -= count % 3;
+    if (n_tri + count > TRI_MAX) count = (TRI_MAX - n_tri) / 3 * 3;
+    if (count <= 0) return 1;
+    if (n_tri + count > tri_cap) {
+        const int cap = n_tri + count < 3072 ? 3072 : (n_tri + count) * 2 > TRI_MAX ? TRI_MAX : (n_tri + count) * 2;
+        tvert *t = (tvert *)realloc(tri, (size_t)cap * sizeof(tvert));
+        if (!t) return 0;
+        tri = t; tri_cap = cap;
+    }
+    for (i = 0; i < count; i++) {
+        tri[n_tri + i].x = v[i].x - 0.5f; tri[n_tri + i].y = v[i].y - 0.5f; tri[n_tri + i].z = 0; tri[n_tri + i].rhw = 1;
+        tri[n_tri + i].col = v[i].argb;
+    }
+    n_tri += count;
+    return 1;
 }
 
 /* WA's show-frame and whatever other modules hung on it (wkMapZoom: its safety net before, its dial after), for a frame
@@ -1460,6 +1878,7 @@ static uint32_t *__attribute__((fastcall)) hook_show(void *be, uint32_t *result,
     frames++;
     st.frames++;
     frame_started = 0;
+    if (zm_on) { target_swap(); zmap.dirty = 1; frame_abort = 1; }   /* (a map part that was never ended) */
     if (opt_trace && frames == 400) { tracing = 1; trace_left = (unsigned)opt_trace; say("trace: %u frames from here (mode %d)", trace_left, mode); }
     if (tracing) { say("show: frame %u mode %d, %d GPU operations, frame %p", frames, mode, frame_ops, frame); if (!trace_left--) tracing = 0; }
     if (mode == ACTIVE) {
@@ -1475,9 +1894,10 @@ static uint32_t *__attribute__((fastcall)) hook_show(void *be, uint32_t *result,
             take_layer(dev, 1);
             draw_ops(dev);
         }
-        if (dev && !frame_abort && ref && chk_surf && test_zoom == 1.0 && frames % (unsigned)opt_check == 0) check_frame(dev);
+        if (dev && !frame_abort && ref && chk_surf && test_zoom == 1.0 && !zframe && frames % (unsigned)opt_check == 0) check_frame(dev);
         if (dev && !frame_abort) {
-            if (test_zoom == 1.0) {
+            if (zframe) whole_quad(dev, zs_tex, sh_plain);   /* a zoomed frame: its true-colour picture as it is */
+            else if (test_zoom == 1.0) {
                 gop o;
                 vert *v;
                 memset(&o, 0, sizeof(o));
@@ -1497,11 +1917,22 @@ static uint32_t *__attribute__((fastcall)) hook_show(void *be, uint32_t *result,
                     IDirect3DDevice9_EndScene(dev);
                 }
             } else update_palette();         /* (zoomed test frames: drawn through the palette as it was) */
+            draw_overlays(dev);
             draw_notice(dev);
             gpu_frames++;
             st.gpu++;
             chk_n = 0;
             frame_ops = 0; cpu_maybe = 0; zoom_clear = 1;
+            zs_shown = zframe; zframe = 0; rt_used = 0;
+            if (opt_stats && zs_shown) {
+                static DWORD at;
+                static unsigned n;
+                n++;
+                if (GetTickCount() - at >= 1000) {
+                    say("stats: zoomed: %u frames; map part %dx%d of %dx%d at %.1f%%, %d samples a pixel", n, zm_rw, zm_rh, zmap.w, zmap.h, zm_zoom * 100.0, zm_taps * zm_taps);
+                    at = GetTickCount(); n = 0;
+                }
+            }
             cooldown_next = 2;
             if (show_chain) r = ghost_show(dev, be, result, frame);
             else { *result = P32(VA(BE_OK_VA)); r = result; }
@@ -1525,6 +1956,7 @@ static uint32_t *__attribute__((fastcall)) hook_show(void *be, uint32_t *result,
         /* not the GPU's frame: nothing reached the module (another module drew the map: the frame is whole), or it
          * could not be finished (WA shows what there is; the next frame is WA's own again) */
         if (frame_ops) say("frame %u could not be finished on the GPU (%d operations): shown as far as WA drew it", frames, frame_ops);
+        zs_shown = 0; n_ovl = n_tri = 0;
         st.foreign++;
         restore_states();
         r = orig_show(be, result, frame);

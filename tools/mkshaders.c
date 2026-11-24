@@ -18,6 +18,7 @@ typedef HRESULT(WINAPI *compile_fn)(const void *, SIZE_T, const char *, const vo
  *   idx_any: into the index target (the index in every channel), exact
  *   final:   the index target through the palette, onto the back buffer
  *   plain:   a true-colour picture as it is (the notice)
+ *   colour:  the vertex's colour (other modules' triangles)
  *   rgb_any: straight through the palette (zoomed frames: what stays 1:1)
  *   avgN:    N x N samples through the palette, averaged, see-through as alpha (premultiplied) */
 static const char *SRC =
@@ -27,6 +28,7 @@ static const char *SRC =
     "float4 idx_any(float2 uv : TEXCOORD0, float4 col : COLOR0) : COLOR { float i = pick(uv, col); return float4(i, i, i, 1); }\n"
     "float4 final(float2 uv : TEXCOORD0) : COLOR { return look(tex2D(idx, uv).r); }\n"
     "float4 plain(float2 uv : TEXCOORD0) : COLOR { return tex2D(idx, uv); }\n"
+    "float4 colour(float4 col : COLOR0) : COLOR { return col; }\n"
     "float4 rgb_any(float2 uv : TEXCOORD0, float4 col : COLOR0) : COLOR { return float4(look(pick(uv, col)).rgb, 1); }\n"
     "#ifdef N\n"
     "float4 avg(float2 uv : TEXCOORD0, float4 lim : TEXCOORD1, float4 col : COLOR0) : COLOR {\n"
@@ -69,9 +71,11 @@ int main(int argc, char **argv) {
     fprintf(out, "/* made by tools\\mkshaders.c (Direct3D 9 pixel shader byte code): do not edit */\n");
     ok = emit(out, cf, "ps_idx_any", "idx_any", "ps_2_0", NULL) && emit(out, cf, "ps_final", "final", "ps_2_0", NULL) &&
          emit(out, cf, "ps_plain", "plain", "ps_2_0", NULL) &&
+         emit(out, cf, "ps_colour", "colour", "ps_2_0", NULL) &&
          emit(out, cf, "ps_rgb_any", "rgb_any", "ps_2_0", NULL) &&
          emit(out, cf, "ps_avg2", "avg", "ps_3_0", "2") && emit(out, cf, "ps_avg3", "avg", "ps_3_0", "3") &&
-         emit(out, cf, "ps_avg4", "avg", "ps_3_0", "4");
+         emit(out, cf, "ps_avg4", "avg", "ps_3_0", "4") && emit(out, cf, "ps_avg6", "avg", "ps_3_0", "6") &&
+         emit(out, cf, "ps_avg8", "avg", "ps_3_0", "8");
     fclose(out);
     return ok ? 0 : 2;
 }
